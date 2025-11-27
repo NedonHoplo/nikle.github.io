@@ -1,0 +1,15 @@
+{
+  "name": "simple-live-demo",
+  "version": "1.0.0",
+  "description": "Simple browser live demo with screenshot feature (WebRTC + socket.io)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "socket.io": "^4.7.2"
+  }
+}
