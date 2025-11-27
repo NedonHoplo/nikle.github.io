@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>简单视频直播（含截图）</title>
+		<style>
+			body { font-family: Arial, Helvetica, sans-serif; padding: 16px; background:#f7f7f7 }
+			header { display:flex; align-items:center; gap:16px; }
+			.controls { margin-top:12px; }
+			video { background: #000; width: 640px; height:360px; }
+			#remoteVideos { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px }
+			.remote { width:320px; height:180px; background:#111 }
+			button { margin-right:8px }
+		</style>
+	</head>
+	<body>
+		<header>
+			<h1>简单视频直播（含截图）</h1>
+		</header>
+
+		<p>说明：打开此页面可选择“主播”或“观众”。主播将使用本机摄像头并推流；观众可观看。主播可在任意时刻截取当前画面并下载。</p>
+
+		<div class="controls">
+			<button id="btnBroadcaster">成为主播</button>
+			<button id="btnViewer">成为观众</button>
+			<button id="btnStop" disabled>停止/离开</button>
+			<button id="btnScreenshot" disabled>截图并下载</button>
+		</div>
+
+		<section style="margin-top:12px">
+			<div>
+				<h3>本地/主播预览</h3>
+				<video id="localVideo" autoplay muted playsinline></video>
+			</div>
+
+			<div style="margin-top:12px">
+				<h3>远程/观众视图（如果有多位观众/主播连接会显示）</h3>
+				<div id="remoteVideos"></div>
+			</div>
+		</section>
+
+		<canvas id="screenshotCanvas" style="display:none"></canvas>
+
+		<script src="/socket.io/socket.io.js"></script>
+		<script>
+			// 基本约定：单个主播，多观众。使用 socket.io 做信令，每个 peer 用 socket.id 识别。
+			const socket = io();
+			const localVideo = document.getElementById('localVideo');
+			const remoteVideos = document.getElementById('remoteVideos');
+			const btnBroadcaster = document.getElementById('btnBroadcaster');
+			const btnViewer = document.getElementById('btnViewer');
+			const btnStop = document.getElementById('btnStop');
+			const btnScreenshot = document.getElementById('btnScreenshot');
+			const canvas = document.getElementById('screenshotCanvas');
+
+			let localStream = null;
+			let role = null; // 'broadcaster' | 'viewer'
+			const peerConnections = {}; // id => RTCPeerConnection
+			const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+			// UI handlers
+			btnBroadcaster.onclick = async () => {
+				await startAsBroadcaster();
+			};
+
+			btnViewer.onclick = async () => {
+				await startAsViewer();
+			};
+
+			btnStop.onclick = () => {
+				stopAll();
+			};
+
+			btnScreenshot.onclick = () => {
+				takeScreenshot();
+			};
+
+			async function startAsBroadcaster() {
+				if (role === 'broadcaster') return;
+				try {
+					localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+				} catch (e) {
+					alert('获取摄像头/麦克风权限失败：' + e.message);
+					return;
+				}
+				localVideo.srcObject = localStream;
+				role = 'broadcaster';
+				btnStop.disabled = false;
+				btnScreenshot.disabled = false;
+				btnBroadcaster.disabled = true;
+				btnViewer.disabled = true;
+				socket.emit('broadcaster');
+			}
+
+			async function startAsViewer() {
+				if (role === 'viewer') return;
+				role = 'viewer';
+				btnStop.disabled = false;
+				btnBroadcaster.disabled = true;
+				btnViewer.disabled = true;
+				btnScreenshot.disabled = true;
+				socket.emit('watcher');
+			}
+
+			function stopAll() {
+				// close all peerConnections
+				Object.values(peerConnections).forEach(pc => {
+					try { pc.close(); } catch(e){}
+				});
+				for (const id in peerConnections) delete peerConnections[id];
+				if (localStream) {
+					localStream.getTracks().forEach(t => t.stop());
+					localStream = null;
+				}
+				localVideo.srcObject = null;
+				remoteVideos.innerHTML = '';
+				socket.emit('disconnect');
+				role = null;
+				btnStop.disabled = true;
+				btnBroadcaster.disabled = false;
+				btnViewer.disabled = false;
+				btnScreenshot.disabled = true;
+			}
+
+			function createRemoteVideo(id) {
+				let v = document.getElementById('remote-' + id);
+				if (v) return v;
+				v = document.createElement('video');
+				v.id = 'remote-' + id;
+				v.autoplay = true;
+				v.playsInline = true;
+				v.className = 'remote';
+				remoteVideos.appendChild(v);
+				return v;
+			}
+
+			// 截图：把本地 video 当前帧绘制到 canvas 并下载
+			function takeScreenshot() {
+				const v = localVideo;
+				if (!v || !v.videoWidth) {
+					alert('视频未就绪，无法截图');
+					return;
+				}
+				canvas.width = v.videoWidth;
+				canvas.height = v.videoHeight;
+				const ctx = canvas.getContext('2d');
+				ctx.drawImage(v, 0, 0, canvas.width, canvas.height);
+				canvas.toBlob(blob => {
+					const url = URL.createObjectURL(blob);
+					const a = document.createElement('a');
+					a.href = url;
+					a.download = 'screenshot_' + Date.now() + '.png';
+					document.body.appendChild(a);
+					a.click();
+					a.remove();
+					URL.revokeObjectURL(url);
+				}, 'image/png');
+			}
+
+			// --- socket.io signaling handlers ---
+			socket.on('connect', () => {
+				console.log('connected to signaling server');
+			});
+
+			// when a watcher connects, broadcaster should create a peer for that watcher
+			socket.on('watcher', async (id) => {
+				if (role !== 'broadcaster') return;
+				const pc = new RTCPeerConnection(config);
+				peerConnections[id] = pc;
+				// add local tracks
+				localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+				// ICE
+				pc.onicecandidate = event => {
+					if (event.candidate) {
+						socket.emit('candidate', id, event.candidate);
+					}
+				};
+
+				// create offer
+				const offer = await pc.createOffer();
+				await pc.setLocalDescription(offer);
+				socket.emit('offer', id, pc.localDescription);
+			});
+
+			// viewer receives offer from broadcaster
+			socket.on('offer', async (id, description) => {
+				if (role !== 'viewer') return;
+				const pc = new RTCPeerConnection(config);
+				peerConnections[id] = pc;
+
+				pc.ontrack = event => {
+					let v = createRemoteVideo(id);
+					v.srcObject = event.streams[0];
+				};
+
+				pc.onicecandidate = event => {
+					if (event.candidate) {
+						socket.emit('candidate', id, event.candidate);
+					}
+				};
+
+				await pc.setRemoteDescription(description);
+				const answer = await pc.createAnswer();
+				await pc.setLocalDescription(answer);
+				socket.emit('answer', id, pc.localDescription);
+			});
+
+			socket.on('answer', (id, description) => {
+				const pc = peerConnections[id];
+				if (!pc) return;
+				pc.setRemoteDescription(description);
+			});
+
+			socket.on('candidate', (id, candidate) => {
+				const pc = peerConnections[id];
+				if (!pc) return;
+				pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(e => console.error(e));
+			});
+
+			socket.on('broadcaster', () => {
+				// 如果有人成为主播且我是观众，触发 watcher（通常在进入观众时已经发过一次）
+				if (role === 'viewer') socket.emit('watcher');
+			});
+
+			socket.on('disconnectPeer', id => {
+				const pc = peerConnections[id];
+				if (pc) {
+					try { pc.close(); } catch(e){}
+					delete peerConnections[id];
+				}
+				const v = document.getElementById('remote-' + id);
+				if (v) v.remove();
+			});
+
+			// 当页面关闭/刷新时清理
+			window.addEventListener('beforeunload', () => {
+				try { socket.close(); } catch (e) {}
+			});
+		</script>
+	</body>
+</html>
+
